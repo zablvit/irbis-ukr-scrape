@@ -17,7 +17,7 @@
 """
 
 from __future__ import annotations
-import re, sqlite3, time
+import re, sqlite3, logging
 from pathlib import Path
 from typing import Dict, List
 
@@ -29,10 +29,10 @@ from unidecode import unidecode
 
 # -------------------------------------------------- CONSTANTS ---------
 
-BASE_CGI   = "https://irbis-nbuv.gov.ua/cgi-bin/irbis_ir/cgiirbis_64.exe"
+BASE_CGI   = "https://irbis-nbuv.gov.ua/cgi-bin/ua/elib.exe"
 START_GET  = (
-    "https://irbis-nbuv.gov.ua/cgi-bin/irbis_ir/cgiirbis_64.exe?"
-    "S21CNR=20&S21REF=10&S21STN=1&C21COM=S&I21DBN=ELIB&P21DBN=ELIB"
+    "https://irbis-nbuv.gov.ua/cgi-bin/ua/elib.exe?"
+    "S21CNR=20&S21REF=10&S21STN=1&C21COM=S&I21DBN=UKRLIB&P21DBN=UKRLIB"
     "&S21All=(<.>J=ukr<.>)&S21FMT=preitem&S21SRW=dz&S21SRD=UP"
 )
 PAGE_SIZE  = 20                        # records per page
@@ -40,14 +40,29 @@ CSV_PATH   = Path("ukrainian_literature_1700-2024.csv")
 SQLITE_DB  = Path("ukr_lit.sqlite")
 YEAR_RE    = re.compile(r"\b(17\d{2}|18\d{2}|19\d{2}|20[0-2]\d)\b")
 
+ENC_S21ALL = "%28%3C.%3EJ%3Dukr%3C.%3E%29"   # encoded (<.>J=ukr<.>)
+
 HEADERS = {
     "User-Agent": "irbis-scraper/0.1 (mailto:you@example.com)",
 }
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
 # -------------------------------------------------- HELPERS ---------
 
+def _s(val) -> str:
+    """Return a clean string; convert NaN/None/float to empty str."""
+    if val is None:
+        return ""
+    if isinstance(val, float):  # catches NaN
+        return "" if pd.isna(val) else str(val)
+    return str(val)
+
 def key(author: str, title: str) -> str:
-    return f"{unidecode(author).lower().strip()}|{unidecode(title).lower().strip()}"
+    return (
+        f"{unidecode(_s(author)).lower().strip()}|"
+        f"{unidecode(_s(title)).lower().strip()}"
+    )
 
 def get_soup(session: requests.Session, url: str, encoding="cp1251") -> BeautifulSoup:
     r = session.get(url, headers=HEADERS, timeout=30)
@@ -65,41 +80,44 @@ def post_soup(session: requests.Session, data: Dict[str, str], encoding="cp1251"
 
 def extract_hits(soup: BeautifulSoup) -> List[dict]:
     """
-    Walk one preitem list‑page and return rows
-    (title, author, year, work_key).
+    Parse one preitem list‑page.
+    Handles two link styles:
+        1) classic    …S21FMT=fullwebr
+        2) DLib item  /dlib/item/0001234
+    Extracts title, author (if <em> present), first 4‑digit year.
     """
     out = []
-    for a in soup.select('a[href*="S21FMT=fullwebr"]'):
-        title = a.get_text(strip=True)
+
+    for tr in soup.find_all("tr"):
+        b_tag = tr.find("b")
+        if not b_tag or not re.match(r"\d+\.", b_tag.get_text()):
+            continue                # not a record row
+
+        # pick first link that looks like a record
+        link = tr.find("a", href=re.compile(r"S21FMT=fullwebr|/dlib/item/"))
+        if not link:
+            continue
+
+        title = link.get_text(strip=True)
         if not title:
             continue
 
-        # author sits in <em> inside the same <p>
-        p = a.find_parent("p")
-        author = ""
-        if p:
-            em = p.find("em")
-            if em:
-                author = em.get_text(strip=True)
+        em = tr.find("em")
+        author = em.get_text(strip=True) if em else ""
 
-        # year = first 4‑digit number in the surrounding row
-        tr = a.find_parent("tr")
-        block = str(tr) if tr else a.parent
-        m = YEAR_RE.search(block)
-        year = int(m.group()) if m else 0
-        if not author or year == 0:
-            continue
-
-        if any(x in title.lower() for x in ("п'єс", "драма", "комедія", "есе")):
-            continue
+        # year: try the dedicated <span>YYYY</span> cell; ignore row‑index numbers
+        yr_span = tr.find("span", string=re.compile(r"^\d{4}$"))
+        year = int(yr_span.text) if yr_span else None
 
         out.append({
             "title":           title,
             "author":          author,
             "year_written":    None,
-            "year_published":  year,
+            "year_published":  year if year else None,
             "work_key":        key(author, title),
         })
+
+    logging.info(f"   extracted {len(out)} rows from page")
     return out
 
 # -------------------------------------------------- SCRAPER ---------
@@ -126,12 +144,12 @@ def harvest() -> pd.DataFrame:
         # Form data for this page
         data = {
             "C21COM": "S",
-            "P21DBN": "ELIB",
-            "I21DBN": "ELIB",
+            "P21DBN": "UKRLIB",
+            "I21DBN": "UKRLIB",
             "S21FMT": "preitem",
-            "S21ALL": "(<.>RPUB=!<.>)*(<.>J=ukr<.>)",
+            "S21ALL": ENC_S21ALL,
             "S21CNR": str(PAGE_SIZE),
-            "S21REF": str(start_rec),
+            "S21REF": "10",        # IRBIS expects constant ref index
             "S21SRD": "UP",
             "S21SRW": "dz",
             "S21STN": str(start_rec),
@@ -144,14 +162,26 @@ def harvest() -> pd.DataFrame:
             break
         rows.extend(got)
 
-        start_rec += PAGE_SIZE
-        pbar.update()
+        # --- determine next page via last ordinal number on current page ---
+        indices = [int(n) for n in re.findall(r"<b>(\d+)\.</b>", str(page))]
+        if not indices:
+            # fallback: pick min hidden S21STN > current
+            hidden = [int(v) for v in re.findall(r'name="S21STN"\s+value="(\d+)"', str(page))]
+            cands = [v for v in hidden if v > start_rec]
+            if not cands:
+                logging.info("no next S21STN found – stop")
+                break
+            next_start = min(cands)
+        else:
+            next_start = max(indices) + 1
 
-        # IRBIS returns same page if index too high → stop
-        if str(start_rec) not in page.text:
+        logging.info(f"page done, next S21STN = {next_start}")
+
+        if next_start <= start_rec or next_start > 40000:   # safety cap
             break
+        start_rec = next_start
 
-        time.sleep(0.4)   # polite delay
+        pbar.update()
 
     pbar.close()
     return pd.DataFrame(rows)
@@ -164,7 +194,9 @@ def load_master() -> pd.DataFrame:
 
     df = pd.read_csv(CSV_PATH,
                      dtype={"year_written":"Int64","year_published":"Int64"})
-    if not df.empty and "work_key" not in df.columns:
+    if not df.empty:
+        if "work_key" in df.columns:
+            df = df.drop(columns=["work_key"])
         df["work_key"] = df.apply(lambda r: key(r.author, r.title), axis=1)
     return df
 
