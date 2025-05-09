@@ -1,4 +1,4 @@
-# Ukrainian languiage literatute by year
+# Ukrainian language literature by year
 
 Scrape of Ucrainica database of Vernadskyi national library of Ukraine for Ukrainian literature works
 
